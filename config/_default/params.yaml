@@ -63,7 +63,7 @@ series:
 
 
 # Default color scheme
-colorScheme: "claude"
+colorScheme: "purpley"
 themes:
   claude:
     name: "Claude"

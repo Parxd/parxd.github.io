@@ -393,7 +393,7 @@ for (uint iter = 0;  iter < k_iters; ++iter) {
 
     CUTE_UNROLL
     for (uint block = 0; block < rmem_blocks - 1; ++block) {
-        copy(tCsA(_,_,block+1,pipe_read), tCrA(_,_,block_pipe^1));  // TODO: call before gemm to interleave?
+        copy(tCsA(_,_,block+1,pipe_read), tCrA(_,_,block_pipe^1));
         gemm(tiled_mma, tCrA(_,_,block_pipe), tCrB(_,_,block_pipe), tCrC);
         copy(tCsB(_,_,block+1,pipe_read), tCrB(_,_,block_pipe^1));
         block_pipe ^= 1;
@@ -622,6 +622,6 @@ for (uint col = 0; col < size<2>(tCgC); ++col) {
 Lastly, note the use of `AutoVectorizingCopy` as the first argument. This allows `copy` to automatically dispatch to an instruction of the widest common alignment between the source and destination tensors.
 
 ## conclusion
-In this article, we've taken a deceivingly simple single-precision GEMM to a SOTA implementation on an older Ampere GPU, learning many CUTLASS CuTe concepts along the way. The more general techniques and optimizations we've touched on also apply to production kernels in deep learning libraries. The full code for this kernel is available [here](https://github.com/Parxd/kernels/blob/main/src/sgemm/cutlass/ampere_sgemm_128x32_3stage.cu).
+In this article, we've taken a deceivingly simple single-precision GEMM to a pretty fast implementation on an older Ampere GPU, learning many CUTLASS CuTe concepts along the way. The more general techniques and optimizations we've touched on also apply to production kernels in deep learning libraries. The full code for this kernel is available [here](https://github.com/Parxd/kernels/blob/main/src/sgemm/cutlass/ampere_sgemm_128x32_3stage.cu).
 
 If you've made it this far, thank you for your attention; I really hope you were able to pick up a thing or two and gained an appreciation for how deep the kernel optimization rabbithole can get. 
