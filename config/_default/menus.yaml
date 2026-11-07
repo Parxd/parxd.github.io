@@ -13,7 +13,7 @@ main:
 # footer menu
 footer:
   - name: Contact
-    url: https://google.com
+    url: mailto:dpark0909@gmail.com
     weight: 20
     params:
       icon: contact

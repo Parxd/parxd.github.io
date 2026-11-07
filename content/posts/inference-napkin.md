@@ -1,7 +1,6 @@
 ---
 title: "Back-of-the-napkin LLM inference"
 date: 2026-10-28
-comment: true
 draft: false
 tags: ["math", "llm"]
 ---

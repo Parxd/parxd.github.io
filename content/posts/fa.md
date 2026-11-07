@@ -1,24 +1,11 @@
 ---
 title: "FlashAttention from first principles"
 date: 2026-10-04
-comment: true
 draft: false
 tags: ["CUDA", "GPU", "math"]
 ---
-Key trick centers around online softmax and never materializing $QK^T$ explicitly.
 
-Recall the softmax of a vector $x \in \R^n$ of logits is:
-$$ {x} = \begin{bmatrix} x_1 \\ x_2 \\ \dots \\ x_n \end{bmatrix} $$
-$$ m({x}) = \text{max}({x}) $$
-With re-shift term for numerical stability:
-$$ f({x}) = \begin{bmatrix} e^{x_1 - m(x)} \\ e^{x_2 - m(x)} \\ \dots \\ e^{x_n - m(x)} \end{bmatrix}$$
-$$ \text{softmax}({x}) = \frac{f({x})}{\sum_i e^{x_i - m(x)}} $$
-
-Great, but we need the global maximum of the entire vector $x$. Recall that attention requires $\text{softmax}(QK^T)$, where the softmax is row-wise, since we want the probabilities of how much each *query* attends to every *key* . 
-
-![img1](/images/posts/fa/1.png)
-
-The naive approach to this pre-FlashAttention was running one GEMM (general matrix-multiply) for $P := QK^T$, a softmax kernel (along with scaling by $\frac{1}{\sqrt{d}}$), and another GEMM for $O := PV$. However, for the target hardware we'd like to run this on (massively parallel processors like GPUs), this approach leads to underutilized resources and a much longer runtime for two main reasons:
+The "naive" approach to this pre-FlashAttention was running one GEMM (general matrix-multiply) for $P := QK^T$, a softmax kernel (along with scaling by $\frac{1}{\sqrt{d}}$), and another GEMM for $O := PV$. However, for the target hardware we'd like to run this on (massively parallel processors like GPUs), this approach leads to underutilized resources and a much longer runtime for two main reasons:
 - Loading/storing memory to/from off-chip DRAM at every intermediate step is very slow. Off-chip memory, while very large (on the order of GBs), has a much lower bandwidth than smaller on-chip memory like the programmable shared memory and non-programmable L1/L2 caches.
 ![img2](/images/posts/fa/2.png "Example memory hierarchy. Source: Dao et al., FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness")
 - Repeated kernel launches have overhead. While this overhead isn't horribly large for one kernel (usually in the low microseconds), across multiple attention layers and requests, it can quickly accumulate.
@@ -59,3 +46,68 @@ Getting back to the table, we can see an increasing gap between compute throughp
 You might be starting to see why the naive attention implementation from earlier is inefficient. Writing out $QK^T$ to HBM, reading it back in for the softmax, and so on is a pretty significant amount of memory movement. This is where FlashAttention comes in: what if we could *fuse* all of these operations and keep these intermediate matrices on-chip to cut the memory movement? With the same FLOPs, this would greatly increase arithmetic intensity. Let's step through how the paper introduced just this algorithm.
 
 ## FlashAttention-1
+
+### Online Softmax
+Recall the softmax of a vector $x \in \R^n$ of logits is:
+$$ {x} = \begin{bmatrix} x_1 & x_2 & \dots & x_n \end{bmatrix} $$
+$$ m({x}) = \text{max}({x}) $$
+With re-shift term for numerical stability:
+$$ f({x}) = \begin{bmatrix} e^{x_1 - m(x)} & e^{x_2 - m(x)} & \dots & e^{x_n - m(x)} \end{bmatrix}$$
+$$ \text{softmax}({x}) = \frac{f({x})}{\sum_i e^{x_i - m(x)}} $$
+
+Great, but we need the global maximum $m(x)$ of the entire vector $x$. Recall that attention requires $\text{softmax}(QK^T)$, where the softmax is row-wise, since we want the probabilities of how much each *query* attends to every *key* .
+
+![img1](/images/posts/fa/1.png)
+
+Reading the entire $K^T$ matrix to compute the matmul with $Q$, softmax, and matmul with $V$ onto on-chip memory is impossible. As seen in the earlier diagram, while on-chip memory is fast, it is much smaller in capacity than HBM. So, in typical GPU-algorithm fashion, we'll have to *tile* across $Q, K, V$ to compute small portions of the output at a time. Visualizing:
+![img1](/images/posts/fa/3.png)
+
+You might be able to immediately see a potential issue. If we compute $P$ tile-by-tile, how do we compute the row-wise softmax, which requires the global maximum? The paper introduces *online* softmax for this. To understand, consider a simpler case with 2 concatenated vectors: $x = \begin{bmatrix} x^{(1)} & x^{(2)}\end{bmatrix}$.
+
+Suppose $m(x)$ is the max across both vectors, and $m(x^{(1)}), m(x^{(2)})$ are the maximums for $x^{(1)}, x^{(2)}$, respectively. Then the (elementwise) exponentiated numerator for the softmax is:
+$$ f(x) = \begin{bmatrix} e^{x^{(1)} - m(x)} & e^{x^{(2)} - m(x)}  \end{bmatrix}$$
+
+We can re-write the vectors in terms of their respective local maxes:
+$$ f(x) = \begin{bmatrix} e^{ m(x^{(1)}) - m(x) } (e^{x^{(1)} - m(x^{(1)})}) & e^{ m(x^{(2)}) - m(x) } (e^{x^{(2)} - m(x^{(2)})}) \end{bmatrix}$$
+
+and the same for the denominators $\ell(x^{(n)}) = \sum e^{x^{(n)} - m(x^{(n)})}$ (excuse my loose notation&mdash;this is referring to summation of the exponentiated vector $n$):
+$$ \ell(x) = \ell ( \begin{bmatrix} x^{(1)} & x^{(2)} \end{bmatrix} ) = e^{ m(x^{(1)}) - m(x) } \ell (x^{(1)}) + e^{ m(x^{(2)}) - m(x) } \ell (x^{(2)})$$
+
+...which suggests that it's possible do some sort of running renormalization of past vectors with the newly seen max. The algorithm keeps track of the currently seen max and denominator and constantly rescales all past outputs to exponents to be in "units" of the *newly* seen max.
+
+### Algorithm
+![img1](/images/posts/fa/4.png "FlashAttention-1 algorithm. Source: Dao et al., FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness")
+
+Up until line 10, you can see that the algorithm is just computing tile-local values. Note that $\tilde{P}_{ij}$ is still the unnormalized numerator; division happens later. Pretty standard, nothing new there. Line 11 is where the algorithm updates the running max and rescaled denominator for each row. The line:
+
+$$ \ell_i^{\text{new}} = e^{m_i - m_i^{\text{new}}} \ell_i + e^{\tilde{m}_{ij} - m_i^{\text{new}}} \tilde{\ell}_{ij} $$
+
+...is what we saw in the earlier online softmax example. Line 12 is a bit packed, so I'll go over each term of the sum separately. For the $PV$ matmul:
+
+$$ O_i \leftarrow \dots + e^{\tilde{m}_{ij} - m_i^{\text{new}}} \tilde{P}_{ij}V_j $$
+
+Since we just computed $\tilde{P}_{ij}$ in "units" of $\tilde{m}_{ij}$, we need to rescale it using the difference between it and the updated running max&mdash;we saw this earlier with $f(x)$. Also, keep in mind that this $PV$ matmul is a reduction along the sequence length, *not* the head dimension like in $QK^T$. Focusing on just one row $r$ of $\tilde{P}_{ij}$, where $k$ ranges from the tile's starting to ending index:
+
+$$ O_i[r, :] \leftarrow \dots + e^{\tilde{m}_{ij}[r] - m_i^{\text{new}}[r]} \sum_{k} \tilde{P}_{ij}[r, k] \cdot V_{j}[k, :] $$
+$$ \leftarrow \dots +  \sum_{k} e^{\tilde{m}_{ij}[r] - m_i^{\text{new}}[r]} (e^{S_{ij}[r, k] - \tilde{m}_{ij}} \cdot V_{j}[k, :]) $$
+$$ \leftarrow \dots +  \sum_{k} e^{S_{ij}[r, k] - m_i^{\text{new}}[r]} \cdot V_{j}[k, :] $$
+
+So we've shown that multiplying by the rescale factor after computing $PV$ *with the tile-local max* is equivalent to having just computed $PV$ with the running max.
+
+Moving onto the preceding part of Line 12 now, the algorithm applies the renormalization (denominator), but must do so while also rescaling any previous tile's contributions to the running max.
+
+$$ O_i \leftarrow \text{diag}(\ell_i^{\text{new}})^{-1}(\text{diag}(\ell_i)e^{m_i - m_i^{\text{new}}}O_i + \dots)$$
+
+$O_i$ at this point is the sum of all previous tiles' contributions, which means it's in units of $m_i$. Thus, we need to rescale it to $m_i^{\text{new}}$, as we may have seen a larger max in the current tile. After rescaling, we then *undo* the normalization done by $\ell_i$, so that we can directly add the unnormalized current tile's contribution. Left multiplying by the diagonalized $\ell_i$ vector here just indicates elementwise multiplying each row of $O_i$ with each entry in $\ell_i$.
+
+Ok great. Now we have all tiles' (including the current one) unnormalized contributions in units of $m_i^{\text{new}}$. We've already computed the new denominator $\ell_i^{\text{new}}$ in Line 11, so all that's left is to take the reciprocal of its values, diagonalize it, and left-multiply it again. 
+
+---
+
+![img1](/images/posts/fa/5.png)
+
+> [!NOTE]- A Simplification
+> FlashAttention-1 puts the tiling across $K, V$ as the *outer* loop and across $Q$ as the *inner* loop, which means we technically process all $Q$ row tiles for each $K, V$ column tile before moving onto the next.
+> 
+> Thus, the visualization above is when the algorithm has already completed the first iteration of the outer loop. I'll focus on this first to highlight the renormalization logic, but revisit the $Q$ loop after.
+

@@ -1,7 +1,6 @@
 ---
 title: "CuTe-ly writing an SM86 SGEMM"
 date: 2026-02-05
-comment: true
 tags: ["CUDA", "C++", "GPU"]
 ---
 

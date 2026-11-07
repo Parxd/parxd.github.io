@@ -1,32 +1,19 @@
 # Basic site info with SEO
-description: "A modern, clean, and minimal Hugo theme built with Tailwind CSS 4.0. Support custom themes, dark mode, and responsive design."
-keywords: ["Hugo", "Blog", "Theme", "Technology", "Programming"]
+description: "Daniel Park"
+keywords: ["Daniel Park", "blog", "ML systems", "CUDA", "GPU", "LLM inference"]
 defaultAuthor: "Daniel Park"
 language: "en-US"
-shortName: "Hugo Narrow"  # PWA
+shortName: "Daniel Park"  # PWA
 images:
-  - "/images/og-default.avif"
+  - "/images/og-default.png"
 
 # Favicon
 favicon:
   svg: "/favicon.svg"  # SVG format favicon (recommended)
 
-# Author info
+# Author info (fallback; the home page's author block lives in content/_index.md)
 author:
-  name: "Hugo Narrow"
-  title: "A Clean and Minimal Hugo Theme"
-  description: "Focused on content and user experience."
-  avatar: "/images/avatar.svg"
-  social:
-    - name: "GitHub"
-      url: "https://github.com/username"
-      icon: "github"
-    - name: "Twitter"
-      url: "https://twitter.com/username"
-      icon: "twitter"
-    - name: "Email"
-      url: "mailto:hello@example.com"
-      icon: "email"
+  name: "Daniel Park"
 
 # Header configuration (modularized)
 header:
@@ -83,7 +70,7 @@ home:
     - author-section
     - page-content
     - recent-posts
-    - featured-projects.html
+    - featured-projects
 
 
 
@@ -106,10 +93,10 @@ comments:
   # giscus, disqus, utterances, waline, artalk, twikoo
   system: "giscus"
   giscus:
-    repo: "tom2almighty/hugo-narrow-giscus"
-    repoId: "R_kgDOO2gwLg"
+    repo: ""
+    repoId: ""
     category: "General"
-    categoryId: "DIC_kwDOO2gwLs4CrEaf"
+    categoryId: ""
     mapping: "pathname"
     strict: "0"
     reactionsEnabled: "1"

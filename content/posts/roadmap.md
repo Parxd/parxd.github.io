@@ -1,7 +1,6 @@
 ---
 title: "a learning journey through ML systems"
 date: 2026-06-24
-comment: true
 tags: ["personal"]
 ---
 

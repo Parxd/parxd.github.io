@@ -45,6 +45,16 @@ markup:
         superscript:
           enable: false   
       strikethrough: false 
+      # Keep LaTeX intact for KaTeX (prevents `_` / `*` being parsed as emphasis)
+      passthrough:
+        enable: true
+        delimiters:
+          block:
+            - ['\[', '\]']
+            - ['$$', '$$']
+          inline:
+            - ['\(', '\)']
+            - ['$', '$']
   highlight:
     codeFences: true
     guessSyntax: false
