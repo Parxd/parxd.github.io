@@ -5,7 +5,7 @@ draft: false
 tags: ["CUDA", "GPU", "math"]
 ---
 
-The "naive" approach to this pre-FlashAttention was running one GEMM (general matrix-multiply) for $P := QK^T$, a softmax kernel (along with scaling by $\frac{1}{\sqrt{d}}$), and another GEMM for $O := PV$. However, for the target hardware we'd like to run this on (massively parallel processors like GPUs), this approach leads to underutilized resources and a much longer runtime for two main reasons:
+The "naive" approach to attention pre-FlashAttention was running one GEMM (general matrix-multiply) for $P := QK^T$, a softmax kernel (along with scaling by $\frac{1}{\sqrt{d}}$), and another GEMM for $O := PV$. However, for the target hardware we'd like to run this on (massively parallel processors like GPUs), this approach leads to underutilized resources and a much longer runtime for two main reasons:
 - Loading/storing memory to/from off-chip DRAM at every intermediate step is very slow. Off-chip memory, while very large (on the order of GBs), has a much lower bandwidth than smaller on-chip memory like the programmable shared memory and non-programmable L1/L2 caches.
 ![img2](/images/posts/fa/2.png "Example memory hierarchy. Source: Dao et al., FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness")
 - Repeated kernel launches have overhead. While this overhead isn't horribly large for one kernel (usually in the low microseconds), across multiple attention layers and requests, it can quickly accumulate.
@@ -89,25 +89,33 @@ $$ O_i \leftarrow \dots + e^{\tilde{m}_{ij} - m_i^{\text{new}}} \tilde{P}_{ij}V_
 Since we just computed $\tilde{P}_{ij}$ in "units" of $\tilde{m}_{ij}$, we need to rescale it using the difference between it and the updated running max&mdash;we saw this earlier with $f(x)$. Also, keep in mind that this $PV$ matmul is a reduction along the sequence length, *not* the head dimension like in $QK^T$. Focusing on just one row $r$ of $\tilde{P}_{ij}$, where $k$ ranges from the tile's starting to ending index:
 
 $$ O_i[r, :] \leftarrow \dots + e^{\tilde{m}_{ij}[r] - m_i^{\text{new}}[r]} \sum_{k} \tilde{P}_{ij}[r, k] \cdot V_{j}[k, :] $$
-$$ \leftarrow \dots +  \sum_{k} e^{\tilde{m}_{ij}[r] - m_i^{\text{new}}[r]} (e^{S_{ij}[r, k] - \tilde{m}_{ij}} \cdot V_{j}[k, :]) $$
+$$ \leftarrow \dots +  \sum_{k} e^{\tilde{m}_{ij}[r] - m_i^{\text{new}}[r]} (e^{S_{ij}[r, k] - \tilde{m}_{ij}[r]} \cdot V_{j}[k, :]) $$
 $$ \leftarrow \dots +  \sum_{k} e^{S_{ij}[r, k] - m_i^{\text{new}}[r]} \cdot V_{j}[k, :] $$
 
-So we've shown that multiplying by the rescale factor after computing $PV$ *with the tile-local max* is equivalent to having just computed $PV$ with the running max.
+So we've shown that multiplying by the rescale factor after computing $PV$ *with the tile-local max* is equivalent to having just computed $PV$ with the updated running max.
 
 Moving onto the preceding part of Line 12 now, the algorithm applies the renormalization (denominator), but must do so while also rescaling any previous tile's contributions to the running max.
 
 $$ O_i \leftarrow \text{diag}(\ell_i^{\text{new}})^{-1}(\text{diag}(\ell_i)e^{m_i - m_i^{\text{new}}}O_i + \dots)$$
 
-$O_i$ at this point is the sum of all previous tiles' contributions, which means it's in units of $m_i$. Thus, we need to rescale it to $m_i^{\text{new}}$, as we may have seen a larger max in the current tile. After rescaling, we then *undo* the normalization done by $\ell_i$, so that we can directly add the unnormalized current tile's contribution. Left multiplying by the diagonalized $\ell_i$ vector here just indicates elementwise multiplying each row of $O_i$ with each entry in $\ell_i$.
+$O_i$ at this point is the sum of all previous tiles' contributions, which means it's in units of $m_i$. Thus, we need to rescale it to $m_i^{\text{new}}$, as we may have seen a larger max in the current tile. After rescaling, we then *undo* the normalization done by $\ell_i$, so that we can directly add the unnormalized current tile's contribution. Left multiplying by the diagonalized $\ell_i$ vector here just indicates scaling each row $r$ of $O_i$ by the $r^{\text{th}}$ entry of $\ell_i$.
 
-Ok great. Now we have all tiles' (including the current one) unnormalized contributions in units of $m_i^{\text{new}}$. We've already computed the new denominator $\ell_i^{\text{new}}$ in Line 11, so all that's left is to take the reciprocal of its values, diagonalize it, and left-multiply it again. 
+Great, now we have all tiles' (including current) unnormalized contributions in units of $m_i^{\text{new}}$. We've already computed the new denominator $\ell_i^{\text{new}}$ in Line 11, so now we take the reciprocal of its values, diagonalize it, and left-multiply it (or equivalently&mdash;divide each row by $\ell_i^{\text{new}}$). Note the recurrence relation here. If $O_i^t$ is the sum of all contributions through tile $t$:
 
----
+$$ O_i^t \;=\; \frac{1}{\ell_i^t}\left(\underbrace{\ell_i^{t-1}\,e^{m_i^{t-1}-m_i^t}\,O_i^{t-1}}_{\text{prev. tiles}} \;+\; \underbrace{e^{\tilde m_i^t-m_i^t}\,\tilde P_i^t V^t}_{\text{current tile}}\right) $$
 
-![img1](/images/posts/fa/5.png)
+Since we've now included the current tile's contribution to $O_i$, the algorithm writes the running sum out to HBM, and rewrites $\ell_i, m_i$ to be their newly-computed values.
 
-> [!NOTE]- A Simplification
-> FlashAttention-1 puts the tiling across $K, V$ as the *outer* loop and across $Q$ as the *inner* loop, which means we technically process all $Q$ row tiles for each $K, V$ column tile before moving onto the next.
+You might be questioning the need to write out the partial output $O_i$ to HBM. Recall that (from Lines 5-8) the algorithm puts the loop over $K, V$ as the *outer* loop and the one for $Q$ as the inner loop. We need to save the results for the current $O_i$ somewhere off-chip (on-chip memory capacity is limited!) before computing the tile for the next $Q$ tile (see visualization below). This costs extra memory transfers (reads and writes of $O_i, m_i, \ell_i$), which is why FlashAttention-2 tackles exactly this.
+
+> [!note]+ In reality...
+> In practice, the outer loop is partitioned among *warps*. The exact definition of a warp is out of scope, but just keep in mind that we can assign chunks of "work" to independent units of execution (threads) on a GPU.
 > 
-> Thus, the visualization above is when the algorithm has already completed the first iteration of the outer loop. I'll focus on this first to highlight the renormalization logic, but revisit the $Q$ loop after.
+> Simply put, we can do things like split up a large loop into smaller sub-loops and have groups of threads work on each of these sub-loops to expose (thread-level) parallelism.
+> 
+> You might then smartly observe that these warps must then have some way to cross-communicate, since we need to sum up the $O_i$ partials. For FlashAttention-1, this is done through an inter-warp sync and reduction through shared memory. But this tends to be costly in terms of performance, which further motivates FlashAttention-2.
 
+![img1](/images/posts/fa/6.png "$K$ matrix omitted.")
+
+## FlashAttention-2
+![img1](/images/posts/fa/7.png "FlashAttention-2 algorithm. Source: Dao, FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning")
