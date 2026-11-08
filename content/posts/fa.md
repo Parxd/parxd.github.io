@@ -1,11 +1,11 @@
 ---
 title: "FlashAttention from first principles"
-date: 2026-10-04
+date: 2026-08-04
 draft: false
 tags: ["CUDA", "GPU", "math"]
 ---
 
-The "naive" approach to attention pre-FlashAttention was running one GEMM (general matrix-multiply) for $P := QK^T$, a softmax kernel (along with scaling by $\frac{1}{\sqrt{d}}$), and another GEMM for $O := PV$. However, for the target hardware we'd like to run this on (massively parallel processors like GPUs), this approach leads to underutilized resources and a much longer runtime for two main reasons:
+The approach to computing attention pre-FlashAttention was running one matmul for $P \coloneqq QK^T$, a softmax kernel (along with scaling by $\frac{1}{\sqrt{d}}$), and another matmul for $O \coloneqq PV$. However, for the target hardware we'd like to run this on (massively parallel processors like GPUs), this approach leads to underutilized resources and a much longer runtime for two main reasons:
 - Loading/storing memory to/from off-chip DRAM at every intermediate step is very slow. Off-chip memory, while very large (on the order of GBs), has a much lower bandwidth than smaller on-chip memory like the programmable shared memory and non-programmable L1/L2 caches.
 ![img2](/images/posts/fa/2.png "Example memory hierarchy. Source: Dao et al., FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness")
 - Repeated kernel launches have overhead. While this overhead isn't horribly large for one kernel (usually in the low microseconds), across multiple attention layers and requests, it can quickly accumulate.
@@ -118,4 +118,21 @@ You might be questioning the need to write out the partial output $O_i$ to HBM. 
 ![img1](/images/posts/fa/6.png "$K$ matrix omitted.")
 
 ## FlashAttention-2
+Here is the algorithm for FlashAttention-2, released around a year after the initial paper. 
 ![img1](/images/posts/fa/7.png "FlashAttention-2 algorithm. Source: Dao, FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning")
+
+Some key differences:
+- The $Q$ and $K,V$ loops are swapped. With $Q$ as the *outer* loop now, the algorithm doesn't need to write the partial output $O_i$ to HBM; it can keep the running sum in on-chip memory (specifically, thread-local registers) and only write out to HBM after processing all $K,V$ tiles.
+- The $O_i$ kept on-chip is not normalized until the very end, when the inner loop is complete. This removes the need to do the normalization undo and redo we saw in the first version. It still must be rescaled to the running max, however, to be able to add $\tilde{P}_i^{(j)}V_j$ directly (Line 10).
+    - Note: On Line 10, the -1 exponent in $\text{diag}(e^{m_i^{(j-1)} - m_i^{(j)}})^{-1}$ is a typo and shouldn't be there. 
+
+So what do we get for these changes? For each *tile row*, if $b$ is the size of the dtype used in bytes...
+- FA-1 requires $2 \cdot T_c \cdot B_r \cdot d \cdot b$ bytes for reads and writes of the partial $O_i$ tiles, while FA-2 requires $B_r \cdot b \cdot d$ bytes for just the final write. Saved: $B_r \cdot d \cdot b \cdot (2T_c - 1)$ bytes of HBM movement.
+- FA-1 requires $T_c \cdot B_r \cdot d$ FLOPs for the normalization undo/redo, while FA-2 requires $B_r \cdot d$ FLOPs for the one normalization done at the end. Saved: $B_r \cdot d(T_c - 1)$ non-matmul FLOPs.
+
+> [!note]- Parallelism
+> For readers who are more familiar with GPU programming...
+> 
+> FA-1 launches blocks only along the batch and head dimensions, meaning one block handles the entire sequence length for each sequence per query head (still tiled).
+> 
+> FA-2 launches blocks along the batch, head, and *sequence* dimensions. It partitions the sequence length (often very large) among blocks. Furthermore, warps within blocks are partitioned along the query rows. 
